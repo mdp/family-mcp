@@ -1,16 +1,36 @@
 import type { Hono } from "hono";
 import type { Env } from "./env.js";
 import type { Storage } from "./storage.js";
-import { saveTokens, saveUserInfo } from "./storage.js";
+import {
+  getOAuthClient,
+  getOAuthGrant,
+  getOAuthGrantForClient,
+  getRefreshTokenRecord,
+  saveOAuthClient,
+  saveOAuthGrant,
+  saveRefreshToken,
+  saveRotatedRefreshToken,
+  saveTokens,
+  saveUserInfo,
+  tryClaimRefreshTokenRotation,
+  waitForRotatedRefreshToken,
+} from "./storage.js";
 import { signJWT, makeSessionCookie } from "./auth.js";
 import { isAllowedEmail } from "./access-policy.js";
-import type { GoogleTokens, GoogleUserInfo } from "./types.js";
+import type { OAuthTokenResponse } from "./storage.js";
+import type { GoogleTokens, GoogleUserInfo, OAuthClientGrant, RegisteredClient } from "./types.js";
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
 const GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth";
 const GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token";
 const GOOGLE_USERINFO_URL = "https://www.googleapis.com/oauth2/v2/userinfo";
+const OAUTH_STATE_TTL_SECONDS = 10 * 60;
+const MCP_AUTH_CODE_TTL_SECONDS = 5 * 60;
+/** How long a rotated RT may still be replayed (delayed retries / multi-instance clients). */
+const REFRESH_TOKEN_GRACE_TTL_SECONDS = 24 * 60 * 60;
+/** Keep an active RT usable for up to 90 days of offline / no refresh. */
+const REFRESH_TOKEN_TTL_SECONDS = 90 * 24 * 60 * 60;
 
 const GOOGLE_SCOPES = [
   "openid",
@@ -39,19 +59,10 @@ type OAuthState =
 type AuthCodeData = {
   email: string;
   clientId: string;
+  scope: string;
   redirectUri: string;
   codeChallenge: string;
   codeChallengeMethod: string;
-};
-
-type RegisteredClient = {
-  client_id: string;
-  client_id_issued_at: number;
-  redirect_uris: string[];
-  client_name?: string;
-  token_endpoint_auth_method?: string;
-  grant_types?: string[];
-  response_types?: string[];
 };
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -106,6 +117,169 @@ async function pkceChallenge(verifier: string): Promise<string> {
     .replace(/\+/g, "-")
     .replace(/\//g, "_")
     .replace(/=/g, "");
+}
+
+function randomToken(prefix: string): string {
+  const bytes = new Uint8Array(32);
+  crypto.getRandomValues(bytes);
+  return `${prefix}_${Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("")}`;
+}
+
+async function sha256Hex(value: string): Promise<string> {
+  const bytes = new TextEncoder().encode(value);
+  const hash = await crypto.subtle.digest("SHA-256", bytes);
+  return Array.from(new Uint8Array(hash), (b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+async function issueOAuthTokens(
+  storage: Storage,
+  env: Env,
+  grant: OAuthClientGrant,
+): Promise<OAuthTokenResponse> {
+  const refreshToken = randomToken("mcp_rt");
+  const now = Date.now();
+  const updatedGrant = {
+    ...grant,
+    updatedAt: now,
+    lastUsedAt: now,
+  };
+  await Promise.all([
+    saveOAuthGrant(storage, updatedGrant),
+    saveRefreshToken(storage, await sha256Hex(refreshToken), grant.grantId, {
+      expirationTtl: REFRESH_TOKEN_TTL_SECONDS,
+    }),
+  ]);
+
+  const accessToken = await signJWT(
+    {
+      email: grant.email,
+      authMethod: "oauth",
+      clientId: grant.clientId,
+      grantId: grant.grantId,
+    },
+    env.JWT_SECRET,
+    "1h",
+  );
+
+  return {
+    access_token: accessToken,
+    refresh_token: refreshToken,
+    token_type: "bearer",
+    expires_in: 60 * 60,
+    scope: grant.scope,
+  };
+}
+
+/**
+ * Rotate a refresh token with single-flight + grace-period replay.
+ * Concurrent / delayed retries of the same RT return the same token set.
+ */
+async function rotateRefreshToken(
+  storage: Storage,
+  env: Env,
+  refreshTokenHash: string,
+  grant: OAuthClientGrant,
+): Promise<OAuthTokenResponse | { error: "invalid_grant" | "temporarily_unavailable"; description: string }> {
+  // Fast path: already rotated (grace play).
+  const existing = await getRefreshTokenRecord(storage, refreshTokenHash);
+  if (!existing) {
+    return { error: "invalid_grant", description: "Invalid or expired refresh token" };
+  }
+  if (existing.status === "rotated") {
+    return existing.response;
+  }
+
+  const ownerId = crypto.randomUUID();
+  const claim = await tryClaimRefreshTokenRotation(
+    storage,
+    refreshTokenHash,
+    grant.grantId,
+    ownerId,
+    { expirationTtl: REFRESH_TOKEN_GRACE_TTL_SECONDS },
+  );
+
+  if (claim === "missing") {
+    return { error: "invalid_grant", description: "Invalid or expired refresh token" };
+  }
+
+  if (claim === "lost") {
+    // Another worker is rotating (or already finished). Wait for the result.
+    const waited = await waitForRotatedRefreshToken(storage, refreshTokenHash, {
+      timeoutMs: 5_000,
+      pollMs: 25,
+    });
+    if (waited) return waited;
+
+    // Still rotating or became active again — one more read.
+    const latest = await getRefreshTokenRecord(storage, refreshTokenHash);
+    if (latest?.status === "rotated") return latest.response;
+    if (latest?.status === "active") {
+      // Stale claim abandoned without finishing; try once more as winner.
+      const retryOwner = crypto.randomUUID();
+      const retryClaim = await tryClaimRefreshTokenRotation(
+        storage,
+        refreshTokenHash,
+        grant.grantId,
+        retryOwner,
+        { expirationTtl: REFRESH_TOKEN_GRACE_TTL_SECONDS },
+      );
+      if (retryClaim === "won") {
+        const response = await issueOAuthTokens(storage, env, grant);
+        await saveRotatedRefreshToken(storage, refreshTokenHash, grant.grantId, response, {
+          expirationTtl: REFRESH_TOKEN_GRACE_TTL_SECONDS,
+        });
+        return response;
+      }
+      const waitedAgain = await waitForRotatedRefreshToken(storage, refreshTokenHash, {
+        timeoutMs: 3_000,
+        pollMs: 25,
+      });
+      if (waitedAgain) return waitedAgain;
+    }
+    return {
+      error: "temporarily_unavailable",
+      description: "Refresh token rotation in progress; retry shortly",
+    };
+  }
+
+  // We own the claim.
+  try {
+    // Re-check after claim in case a peer finished first and overwrote us.
+    const afterClaim = await getRefreshTokenRecord(storage, refreshTokenHash);
+    if (afterClaim?.status === "rotated") {
+      return afterClaim.response;
+    }
+    if (afterClaim?.status === "rotating" && afterClaim.ownerId !== ownerId) {
+      const waited = await waitForRotatedRefreshToken(storage, refreshTokenHash, {
+        timeoutMs: 5_000,
+        pollMs: 25,
+      });
+      if (waited) return waited;
+      return {
+        error: "temporarily_unavailable",
+        description: "Refresh token rotation in progress; retry shortly",
+      };
+    }
+
+    const response = await issueOAuthTokens(storage, env, grant);
+    await saveRotatedRefreshToken(storage, refreshTokenHash, grant.grantId, response, {
+      expirationTtl: REFRESH_TOKEN_GRACE_TTL_SECONDS,
+    });
+    return response;
+  } catch (error) {
+    // Release claim so another request can retry (best-effort restore to active).
+    console.error(`Refresh rotation failed for grant=${grant.grantId}: ${error}`);
+    const stillOurs = await getRefreshTokenRecord(storage, refreshTokenHash);
+    if (stillOurs?.status === "rotating" && stillOurs.ownerId === ownerId) {
+      await saveRefreshToken(storage, refreshTokenHash, grant.grantId, {
+        expirationTtl: REFRESH_TOKEN_TTL_SECONDS,
+      });
+    }
+    return {
+      error: "temporarily_unavailable",
+      description: "Token refresh failed; retry shortly",
+    };
+  }
 }
 
 const LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1", "[::1]"]);
@@ -172,8 +346,8 @@ export function registerOAuthRoutes(
       registration_endpoint: `${base}/register`,
       response_types_supported: ["code"],
       code_challenge_methods_supported: ["S256"],
-      grant_types_supported: ["authorization_code"],
-      token_endpoint_auth_methods_supported: ["client_secret_post", "none"],
+      grant_types_supported: ["authorization_code", "refresh_token"],
+      token_endpoint_auth_methods_supported: ["none"],
       scopes_supported: ["mcp:tools"],
     });
   });
@@ -225,26 +399,30 @@ export function registerOAuthRoutes(
 
     const clientId = crypto.randomUUID();
     const issuedAt = Math.floor(Date.now() / 1000);
+    const authMethod = body["token_endpoint_auth_method"];
+    if (authMethod && authMethod !== "none") {
+      return c.json({
+        error: "invalid_client_metadata",
+        error_description: "Only public PKCE clients with token_endpoint_auth_method=none are supported",
+      }, 400);
+    }
+
     const client: RegisteredClient = {
       client_id: clientId,
       client_id_issued_at: issuedAt,
       redirect_uris: redirectUris as string[],
       ...(typeof body["client_name"] === "string" ? { client_name: body["client_name"] } : {}),
-      token_endpoint_auth_method:
-        typeof body["token_endpoint_auth_method"] === "string"
-          ? body["token_endpoint_auth_method"]
-          : "client_secret_post",
+      ...(typeof body["client_uri"] === "string" ? { client_uri: body["client_uri"] } : {}),
+      token_endpoint_auth_method: "none",
       grant_types: Array.isArray(body["grant_types"])
         ? (body["grant_types"] as string[])
-        : ["authorization_code"],
+        : ["authorization_code", "refresh_token"],
       response_types: Array.isArray(body["response_types"])
         ? (body["response_types"] as string[])
         : ["code"],
     };
 
-    await stateStorage.put(`mcp:client:${clientId}`, JSON.stringify(client), {
-      expirationTtl: 90 * 24 * 60 * 60,
-    });
+    await saveOAuthClient(tokensStorage, client);
 
     return c.json(client, 201);
   });
@@ -273,13 +451,15 @@ export function registerOAuthRoutes(
       return c.html(htmlPage("Error", "<p>Missing <code>code_challenge</code> (PKCE required).</p>"), 400);
     }
 
-    const clientJson = await stateStorage.get(`mcp:client:${clientId}`);
-    if (!clientJson) {
+    const registeredClient = await getOAuthClient(tokensStorage, clientId);
+    if (!registeredClient) {
       return c.html(htmlPage("Error", "<p>Unknown <code>client_id</code>.</p>"), 400);
     }
-    const registeredClient = JSON.parse(clientJson) as RegisteredClient;
     if (!registeredClient.redirect_uris.includes(redirectUri)) {
       return c.html(htmlPage("Error", "<p><code>redirect_uri</code> is not registered for this client.</p>"), 400);
+    }
+    if (codeChallengeMethod !== "S256") {
+      return c.html(htmlPage("Error", "<p>Only <code>code_challenge_method=S256</code> is supported.</p>"), 400);
     }
 
     const googleState = crypto.randomUUID();
@@ -290,9 +470,11 @@ export function registerOAuthRoutes(
       codeChallenge,
       codeChallengeMethod,
       ...(clientState ? { clientState } : {}),
-      ...(scope ? { scope } : {}),
+      scope: scope || "mcp:tools",
     };
-    await stateStorage.put(`oauth:state:${googleState}`, JSON.stringify(mcpStatePayload), { expirationTtl: 600 });
+    await stateStorage.put(`oauth:state:${googleState}`, JSON.stringify(mcpStatePayload), {
+      expirationTtl: OAUTH_STATE_TTL_SECONDS,
+    });
 
     const googleUrl = new URL(GOOGLE_AUTH_URL);
     googleUrl.searchParams.set("client_id", c.env.GOOGLE_CLIENT_ID);
@@ -321,6 +503,40 @@ export function registerOAuthRoutes(
     const rawBody = await c.req.parseBody().catch(() => ({}) as Record<string, string | File>);
     const str = (k: string) => (typeof rawBody[k] === "string" ? (rawBody[k] as string) : undefined);
     const grantType = str("grant_type");
+
+    if (grantType === "refresh_token") {
+      const refreshToken = str("refresh_token");
+      const clientId = str("client_id");
+      if (!refreshToken || !clientId) {
+        return c.json({ error: "invalid_request", error_description: "Missing refresh_token or client_id" }, 400);
+      }
+
+      const refreshTokenHash = await sha256Hex(refreshToken);
+      const refreshRecord = await getRefreshTokenRecord(tokensStorage, refreshTokenHash);
+      if (!refreshRecord) {
+        return c.json({ error: "invalid_grant", error_description: "Invalid or expired refresh token" }, 400);
+      }
+      const grant = await getOAuthGrant(tokensStorage, refreshRecord.grantId);
+      if (!grant || grant.clientId !== clientId) {
+        return c.json({ error: "invalid_grant", error_description: "Client grant not found" }, 400);
+      }
+
+      // Grace-period replay for an already-rotated RT (delayed retries).
+      if (refreshRecord.status === "rotated") {
+        return c.json(refreshRecord.response);
+      }
+
+      const result = await rotateRefreshToken(tokensStorage, c.env, refreshTokenHash, grant);
+      if ("error" in result) {
+        const status = result.error === "temporarily_unavailable" ? 503 : 400;
+        return c.json(
+          { error: result.error, error_description: result.description },
+          status,
+          result.error === "temporarily_unavailable" ? { "Retry-After": "1" } : undefined,
+        );
+      }
+      return c.json(result);
+    }
 
     if (grantType !== "authorization_code") {
       return c.json({ error: "unsupported_grant_type" }, 400);
@@ -364,14 +580,24 @@ export function registerOAuthRoutes(
       );
     }
 
-    const jwt = await signJWT({ email: codeData.email }, c.env.JWT_SECRET);
+    const client = await getOAuthClient(tokensStorage, clientId);
+    if (!client) {
+      return c.json({ error: "invalid_client", error_description: "Unknown client_id" }, 400);
+    }
 
-    return c.json({
-      access_token: jwt,
-      token_type: "bearer",
-      expires_in: 90 * 24 * 60 * 60,
-      scope: "mcp:tools",
-    });
+    const existingGrant = await getOAuthGrantForClient(tokensStorage, codeData.email, clientId);
+    const grant: OAuthClientGrant = existingGrant ?? {
+      grantId: crypto.randomUUID(),
+      email: codeData.email,
+      clientId,
+      clientName: client.client_name,
+      clientUri: client.client_uri,
+      scope: codeData.scope || "mcp:tools",
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+    };
+
+    return c.json(await issueOAuthTokens(tokensStorage, c.env, grant));
   });
 
   // ── /oauth/authorize — direct browser login via Google ────────────────────
@@ -381,7 +607,7 @@ export function registerOAuthRoutes(
     await stateStorage.put(
       `oauth:state:${state}`,
       JSON.stringify({ type: "direct" }),
-      { expirationTtl: 600 },
+      { expirationTtl: OAUTH_STATE_TTL_SECONDS },
     );
 
     const url = new URL(GOOGLE_AUTH_URL);
@@ -522,11 +748,14 @@ export function registerOAuthRoutes(
       const codeData: AuthCodeData = {
         email: user.email,
         clientId: oauthState.clientId,
+        scope: oauthState.scope || "mcp:tools",
         redirectUri: oauthState.redirectUri,
         codeChallenge: oauthState.codeChallenge,
         codeChallengeMethod: oauthState.codeChallengeMethod,
       };
-      await stateStorage.put(`mcp:code:${authCode}`, JSON.stringify(codeData), { expirationTtl: 60 });
+      await stateStorage.put(`mcp:code:${authCode}`, JSON.stringify(codeData), {
+        expirationTtl: MCP_AUTH_CODE_TTL_SECONDS,
+      });
 
       const redirectUrl = new URL(oauthState.redirectUri);
       redirectUrl.searchParams.set("code", authCode);
@@ -549,7 +778,7 @@ export function registerOAuthRoutes(
       saveUserInfo(tokensStorage, user.email, user),
     ]);
 
-    const jwt = await signJWT({ email: user.email }, c.env.JWT_SECRET);
+    const jwt = await signJWT({ email: user.email, authMethod: "oauth" }, c.env.JWT_SECRET);
     const isSecure = new URL(c.req.url).protocol === "https:";
     c.header("Set-Cookie", makeSessionCookie(jwt, isSecure));
 

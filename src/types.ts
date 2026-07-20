@@ -23,6 +23,9 @@ export interface GoogleUserInfo {
 
 export interface JWTPayload {
   email: string;
+  authMethod?: "oauth";
+  clientId?: string;
+  grantId?: string;
   iat?: number;
   exp?: number;
 }
@@ -31,4 +34,30 @@ export interface JWTPayload {
 
 export interface AuthExtra {
   email: string;
+  authMethod?: "oauth";
+  clientId?: string;
+  grantId?: string;
+}
+
+export interface RegisteredClient {
+  client_id: string;
+  client_id_issued_at: number;
+  redirect_uris: string[];
+  client_name?: string;
+  client_uri?: string;
+  token_endpoint_auth_method: "none";
+  grant_types: string[];
+  response_types: string[];
+}
+
+export interface OAuthClientGrant {
+  grantId: string;
+  email: string;
+  clientId: string;
+  clientName?: string;
+  clientUri?: string;
+  scope: string;
+  createdAt: number;
+  updatedAt: number;
+  lastUsedAt?: number;
 }

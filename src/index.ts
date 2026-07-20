@@ -59,7 +59,8 @@ function ensureOAuthRoutes(env: Env): void {
 // ─── /auth/status ─────────────────────────────────────────────────────────────
 
 app.get("/auth/status", async (c) => {
-  const auth = await resolveAuth(c.req.raw, c.env.JWT_SECRET);
+  const storage = new CloudflareKVStorage(c.env.TOKENS_KV);
+  const auth = await resolveAuth(c.req.raw, c.env.JWT_SECRET, storage, c.executionCtx);
   const wantsJson = c.req.header("accept")?.includes("application/json");
 
   if (!auth) {
@@ -73,7 +74,6 @@ app.get("/auth/status", async (c) => {
     `));
   }
 
-  const storage = new CloudflareKVStorage(c.env.TOKENS_KV);
   const userInfo = await getUserInfoFromStorage(storage, auth.email);
 
   if (wantsJson) {
@@ -142,9 +142,11 @@ app.all("/mcp", async (c) => {
     );
   }
 
-  const auth = await resolveAuth(c.req.raw, c.env.JWT_SECRET);
+  const storage = new CloudflareKVStorage(c.env.TOKENS_KV);
+  const auth = await resolveAuth(c.req.raw, c.env.JWT_SECRET, storage, c.executionCtx);
 
   if (!auth) {
+    const resourceMetadata = `${new URL(c.req.url).origin}/.well-known/oauth-protected-resource`;
     return c.json(
       {
         jsonrpc: "2.0",
@@ -152,6 +154,9 @@ app.all("/mcp", async (c) => {
         id: null,
       },
       401,
+      {
+        "WWW-Authenticate": `Bearer resource_metadata="${resourceMetadata}"`,
+      },
     );
   }
 
@@ -168,7 +173,6 @@ app.all("/mcp", async (c) => {
     );
   }
 
-  const storage = new CloudflareKVStorage(c.env.TOKENS_KV);
   const mcpServer = createMcpServer(storage, c.env, auth.email);
   const transport = new WebStandardStreamableHTTPServerTransport({
     sessionIdGenerator: undefined,

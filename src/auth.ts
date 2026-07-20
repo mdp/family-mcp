@@ -1,5 +1,7 @@
 import { SignJWT, jwtVerify } from "jose";
 import type { JWTPayload } from "./types.js";
+import type { Storage } from "./storage.js";
+import { getOAuthGrant } from "./storage.js";
 
 // ─── JWT ──────────────────────────────────────────────────────────────────────
 
@@ -10,11 +12,16 @@ function jwtSecretKey(secret: string): Uint8Array {
   return new TextEncoder().encode(secret);
 }
 
-export async function signJWT(payload: JWTPayload, secret: string): Promise<string> {
-  return new SignJWT({ email: payload.email })
+export async function signJWT(payload: JWTPayload, secret: string, expiresIn = JWT_EXPIRY): Promise<string> {
+  return new SignJWT({
+    email: payload.email,
+    authMethod: payload.authMethod ?? "oauth",
+    ...(payload.clientId ? { clientId: payload.clientId } : {}),
+    ...(payload.grantId ? { grantId: payload.grantId } : {}),
+  })
     .setProtectedHeader({ alg: JWT_ALGORITHM })
     .setIssuedAt()
-    .setExpirationTime(JWT_EXPIRY)
+    .setExpirationTime(expiresIn)
     .sign(jwtSecretKey(secret));
 }
 
@@ -22,7 +29,14 @@ export async function verifyJWT(token: string, secret: string): Promise<JWTPaylo
   try {
     const { payload } = await jwtVerify(token, jwtSecretKey(secret));
     if (typeof payload.email !== "string") return null;
-    return { email: payload.email, iat: payload.iat, exp: payload.exp };
+    return {
+      email: payload.email,
+      authMethod: "oauth",
+      clientId: typeof payload.clientId === "string" ? payload.clientId : undefined,
+      grantId: typeof payload.grantId === "string" ? payload.grantId : undefined,
+      iat: payload.iat,
+      exp: payload.exp,
+    };
   } catch {
     return null;
   }
@@ -72,10 +86,23 @@ export function getJWTFromRequest(request: Request): string | null {
 export async function resolveAuth(
   request: Request,
   jwtSecret: string,
-): Promise<{ email: string } | null> {
+  storage?: Storage,
+  ctx?: { waitUntil(promise: Promise<unknown>): void },
+): Promise<{ email: string; authMethod?: "oauth"; clientId?: string; grantId?: string } | null> {
   const token = getJWTFromRequest(request);
   if (!token) return null;
   const payload = await verifyJWT(token, jwtSecret);
   if (!payload) return null;
-  return { email: payload.email };
+  if (payload.grantId && storage) {
+    const grant = await getOAuthGrant(storage, payload.grantId);
+    if (!grant || grant.email !== payload.email || grant.clientId !== payload.clientId) return null;
+    const update = storage.put(`mcp:grant:${grant.grantId}`, JSON.stringify({ ...grant, lastUsedAt: Date.now() }));
+    if (ctx) ctx.waitUntil(update);
+  }
+  return {
+    email: payload.email,
+    authMethod: payload.authMethod,
+    clientId: payload.clientId,
+    grantId: payload.grantId,
+  };
 }

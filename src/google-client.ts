@@ -7,6 +7,9 @@ const GOOGLE_USERINFO_URL = "https://www.googleapis.com/oauth2/v2/userinfo";
 // Refresh access token 5 minutes before expiry
 const EXPIRY_BUFFER_MS = 5 * 60 * 1000;
 
+/** In-isolate single-flight for Google token refreshes (keyed by email). */
+const googleRefreshInflight = new Map<string, Promise<string>>();
+
 type GoogleTokenError = {
   error?: string;
   error_description?: string;
@@ -64,6 +67,41 @@ export class GoogleClient {
       throw new Error("No refresh token available. User may need to re-authorize.");
     }
 
+    const existing = googleRefreshInflight.get(this.email);
+    if (existing) {
+      const accessToken = await existing;
+      const stored = await this.storage.get(`google:tokens:${this.email}`);
+      if (stored) {
+        this.tokens = JSON.parse(stored) as GoogleTokens;
+      }
+      return this.tokens.access_token || accessToken;
+    }
+
+    const promise = this.refreshAccessToken().finally(() => {
+      googleRefreshInflight.delete(this.email);
+    });
+    googleRefreshInflight.set(this.email, promise);
+    return promise;
+  }
+
+  private async refreshAccessToken(): Promise<string> {
+    // Re-check expiry under single-flight: another waiter may have finished.
+    const stored = await this.storage.get(`google:tokens:${this.email}`);
+    if (stored) {
+      const latest = JSON.parse(stored) as GoogleTokens;
+      if (Date.now() < latest.expiry_date - EXPIRY_BUFFER_MS) {
+        this.tokens = latest;
+        return this.tokens.access_token;
+      }
+      if (latest.refresh_token) {
+        this.tokens.refresh_token = latest.refresh_token;
+      }
+    }
+
+    if (!this.tokens.refresh_token) {
+      throw new Error("No refresh token available. User may need to re-authorize.");
+    }
+
     const response = await fetch(GOOGLE_TOKEN_URL, {
       method: "POST",
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
@@ -90,7 +128,9 @@ export class GoogleClient {
 
     this.tokens.access_token = data.access_token;
     this.tokens.expiry_date = Date.now() + data.expires_in * 1000;
+    this.tokens.expires_in = data.expires_in;
     this.tokens.obtained_at = Date.now();
+    // Google often omits refresh_token on refresh; never clobber the stored one.
     if (data.refresh_token) {
       this.tokens.refresh_token = data.refresh_token;
     }
