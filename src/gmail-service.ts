@@ -3,6 +3,17 @@ import type { GoogleClient } from "./google-client.js";
 
 const GMAIL_BASE = "https://gmail.googleapis.com/gmail/v1/users/me";
 
+/**
+ * Gmail search snippet automatically appended to every search query to
+ * exclude system / security notifications from Google that have no family
+ * value and may leak internal routing details if surfaced to the MCP.
+ */
+const NOREPLY_GOOGLE_FILTER = "-from:noreply@google.com";
+
+function isNoreplyGoogle(fromHeader: string): boolean {
+  return /noreply@google\.com/i.test(fromHeader);
+}
+
 // --- Types ---
 
 export interface GmailThreadSummary {
@@ -105,8 +116,9 @@ export async function gmailListThreadIds(
   query: string,
   maxResults = 10,
 ): Promise<string[]> {
+  const safeQuery = query ? `${query} ${NOREPLY_GOOGLE_FILTER}` : NOREPLY_GOOGLE_FILTER;
   const params = new URLSearchParams({
-    q: query,
+    q: safeQuery,
     maxResults: String(maxResults),
   });
 
@@ -122,8 +134,9 @@ export async function gmailSearch(
   query: string,
   maxResults = 10,
 ): Promise<GmailThreadSummary[]> {
+  const safeQuery = query ? `${query} ${NOREPLY_GOOGLE_FILTER}` : NOREPLY_GOOGLE_FILTER;
   const params = new URLSearchParams({
-    q: query,
+    q: safeQuery,
     maxResults: String(maxResults),
   });
 
@@ -187,7 +200,12 @@ export async function gmailGetThread(
     }[];
   }>("GET", `${GMAIL_BASE}/threads/${threadId}?format=FULL`);
 
-  return (thread.messages ?? []).map((msg) => {
+  return (thread.messages ?? [])
+    .filter((msg) => {
+      const from = msg.payload?.headers?.find((h) => h.name === "From")?.value ?? "";
+      return !isNoreplyGoogle(from);
+    })
+    .map((msg) => {
     const headers = msg.payload?.headers ?? [];
     const get = (name: string) =>
       headers.find((h) => h.name === name)?.value ?? "";
