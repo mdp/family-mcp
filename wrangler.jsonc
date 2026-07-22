@@ -8,28 +8,16 @@
   "kv_namespaces": [
     {
       "binding": "STATE_KV",
-      "id": "TODO_CREATE_NEW_KV_NAMESPACE"
+      "id": "5ffd7d21fd434df5be91c18bb2b7fca8"
     },
     {
       "binding": "TOKENS_KV",
-      "id": "TODO_CREATE_NEW_KV_NAMESPACE"
+      "id": "715ed22e1daa4b01aa11c5a32b80bb42"
     }
   ],
 
   "vars": {
-    // Comma-separated list of allowed family member email addresses.
-    // These are the only accounts that can log in and operate tools.
-    "ALLOWED_EMAILS": "adult1@example.com,adult2@example.com",
-
-    // JSON array of family profile metadata used in skills, prompts, and
-    // account listings. Keep private values out of source control in forks by
-    // overriding this per environment or setting it as a secret.
-    "FAMILY_MEMBERS": "[{\"name\":\"Adult 1\",\"email\":\"adult1@example.com\",\"relationship\":\"adult\",\"timezone\":\"Etc/UTC\"},{\"name\":\"Adult 2\",\"email\":\"adult2@example.com\",\"relationship\":\"adult\",\"timezone\":\"Etc/UTC\"}]",
-
-    // Comma-separated allowed external recipients for email send/forward
-    // and calendar invites. Supports exact emails (name@example.com) or
-    // domains (example.com or @example.com). Family members from
-    // ALLOWED_EMAILS are always implicitly allowed.
+    "ALLOWED_EMAILS": "percival@gmail.com,alainapercival@gmail.com",
     "ALLOWED_EXTERNAL_RECIPIENTS": ""
   },
 
