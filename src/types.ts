@@ -23,7 +23,7 @@ export interface GoogleUserInfo {
 
 export interface JWTPayload {
   email: string;
-  authMethod?: "oauth";
+  authMethod?: "oauth" | "api_key";
   clientId?: string;
   grantId?: string;
   iat?: number;
@@ -34,9 +34,25 @@ export interface JWTPayload {
 
 export interface AuthExtra {
   email: string;
-  authMethod?: "oauth";
+  authMethod?: "oauth" | "api_key";
   clientId?: string;
   grantId?: string;
+}
+
+// ─── API Key ───────────────────────────────────────────────────────────────────
+
+export interface ApiKey {
+  id: string;
+  email: string;
+  /** Short display name for the key (user-provided at creation). */
+  name: string;
+  /** SHA-256 hex hash of the full bearer token. */
+  tokenHash: string;
+  /** Last 8 chars of the prefix so the user can identify the key. */
+  tokenSuffix: string;
+  createdAt: number;
+  lastUsedAt?: number;
+  revokedAt?: number;
 }
 
 export interface RegisteredClient {

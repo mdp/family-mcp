@@ -1,4 +1,4 @@
-import type { GoogleTokens, GoogleUserInfo, OAuthClientGrant, RegisteredClient } from "./types.js";
+import type { GoogleTokens, GoogleUserInfo, OAuthClientGrant, RegisteredClient, ApiKey } from "./types.js";
 
 // ─── Storage Interface ────────────────────────────────────────────────────────
 
@@ -89,6 +89,8 @@ const OAUTH_CLIENT_PREFIX = "mcp:client:";
 const OAUTH_GRANT_PREFIX = "mcp:grant:";
 const OAUTH_REFRESH_PREFIX = "mcp:refresh:";
 const USER_CLIENT_PREFIX = "mcp:user-client:";
+const API_KEY_PREFIX = "mcp:apikey:";
+const EMAIL_API_KEYS_PREFIX = "mcp:email-apikeys:";
 
 export async function getTokens(storage: Storage, email: string): Promise<GoogleTokens | null> {
   const data = await storage.get(`${TOKEN_PREFIX}${email}`);
@@ -303,5 +305,85 @@ export async function waitForRotatedRefreshToken(
     await new Promise((resolve) => setTimeout(resolve, pollMs));
   }
   return null;
+}
+
+
+// ─── API Key helpers ──────────────────────────────────────────────────────────
+
+export async function saveApiKey(storage: Storage, apiKey: ApiKey): Promise<void> {
+  const emailLower = apiKey.email.toLowerCase();
+  await storage.put(`${API_KEY_PREFIX}${apiKey.tokenHash}`, JSON.stringify(apiKey));
+  // Maintain a set of key IDs per email for listing.
+  const setKey = `${EMAIL_API_KEYS_PREFIX}${emailLower}`;
+  const existing = await storage.get(setKey);
+  const ids: string[] = existing ? JSON.parse(existing) : [];
+  if (!ids.includes(apiKey.id)) ids.push(apiKey.id);
+  await storage.put(setKey, JSON.stringify(ids));
+}
+
+export async function getApiKeyByHash(storage: Storage, tokenHash: string): Promise<ApiKey | null> {
+  const data = await storage.get(`${API_KEY_PREFIX}${tokenHash}`);
+  if (!data) return null;
+  return JSON.parse(data) as ApiKey;
+}
+
+export async function listApiKeysForEmail(storage: Storage, email: string): Promise<ApiKey[]> {
+  const emailLower = email.toLowerCase();
+  const setKey = `${EMAIL_API_KEYS_PREFIX}${emailLower}`;
+  const raw = await storage.get(setKey);
+  if (!raw) return [];
+  let ids: string[];
+  try { ids = JSON.parse(raw); } catch { return []; }
+  if (!Array.isArray(ids)) return [];
+
+  const idSet = new Set(ids);
+  const keys: ApiKey[] = [];
+  const allKeys = await storage.list({ prefix: API_KEY_PREFIX });
+  for (const k of allKeys.keys) {
+    const data = await storage.get(k.name);
+    if (!data) continue;
+    try {
+      const key = JSON.parse(data) as ApiKey;
+      if (idSet.has(key.id) && key.email.toLowerCase() === emailLower) {
+        keys.push(key);
+      }
+    } catch { /* skip malformed */ }
+  }
+  return keys.sort((a, b) => a.createdAt - b.createdAt);
+}
+
+export async function revokeApiKey(storage: Storage, tokenHash: string, email: string): Promise<boolean> {
+  const existing = await getApiKeyByHash(storage, tokenHash);
+  if (!existing || existing.email.toLowerCase() !== email.toLowerCase()) return false;
+  if (existing.revokedAt) return false; // already revoked
+  existing.revokedAt = Date.now();
+  await storage.put(`${API_KEY_PREFIX}${tokenHash}`, JSON.stringify(existing));
+  return true;
+}
+
+export async function touchApiKeyLastUsed(storage: Storage, tokenHash: string): Promise<void> {
+  const existing = await getApiKeyByHash(storage, tokenHash);
+  if (!existing || existing.revokedAt) return;
+  existing.lastUsedAt = Date.now();
+  await storage.put(`${API_KEY_PREFIX}${tokenHash}`, JSON.stringify(existing));
+}
+
+// ─── OAuth Grant listing ─────────────────────────────────────────────────────
+
+export async function listOAuthGrantsForEmail(storage: Storage, email: string): Promise<OAuthClientGrant[]> {
+  const emailLower = email.toLowerCase();
+  const grants: OAuthClientGrant[] = [];
+  const result = await storage.list({ prefix: OAUTH_GRANT_PREFIX });
+  for (const key of result.keys) {
+    const data = await storage.get(key.name);
+    if (!data) continue;
+    try {
+      const grant = JSON.parse(data) as OAuthClientGrant;
+      if (grant.email?.toLowerCase() === emailLower) {
+        grants.push(grant);
+      }
+    } catch { /* skip malformed */ }
+  }
+  return grants.sort((a, b) => a.createdAt - b.createdAt);
 }
 

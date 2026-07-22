@@ -1,7 +1,7 @@
 import { SignJWT, jwtVerify } from "jose";
 import type { JWTPayload } from "./types.js";
 import type { Storage } from "./storage.js";
-import { getOAuthGrant } from "./storage.js";
+import { getOAuthGrant, getApiKeyByHash, touchApiKeyLastUsed } from "./storage.js";
 
 // ─── JWT ──────────────────────────────────────────────────────────────────────
 
@@ -31,7 +31,7 @@ export async function verifyJWT(token: string, secret: string): Promise<JWTPaylo
     if (typeof payload.email !== "string") return null;
     return {
       email: payload.email,
-      authMethod: "oauth",
+      authMethod: typeof payload.authMethod === "string" ? (payload.authMethod as JWTPayload["authMethod"]) : "oauth",
       clientId: typeof payload.clientId === "string" ? payload.clientId : undefined,
       grantId: typeof payload.grantId === "string" ? payload.grantId : undefined,
       iat: payload.iat,
@@ -81,6 +81,21 @@ export function getJWTFromRequest(request: Request): string | null {
   return null;
 }
 
+// ─── API Key support ──────────────────────────────────────────────────────────
+
+/** API keys created by this server are prefixed with `mcp_sk_`. */
+export const API_KEY_PREFIX = "mcp_sk_";
+
+export function isApiKeyToken(token: string): boolean {
+  return token.startsWith(API_KEY_PREFIX);
+}
+
+async function sha256Hex(value: string): Promise<string> {
+  const bytes = new TextEncoder().encode(value);
+  const hash = await crypto.subtle.digest("SHA-256", bytes);
+  return Array.from(new Uint8Array(hash), (b) => b.toString(16).padStart(2, "0")).join("");
+}
+
 // ─── Auth resolution ──────────────────────────────────────────────────────────
 
 export async function resolveAuth(
@@ -88,9 +103,24 @@ export async function resolveAuth(
   jwtSecret: string,
   storage?: Storage,
   ctx?: { waitUntil(promise: Promise<unknown>): void },
-): Promise<{ email: string; authMethod?: "oauth"; clientId?: string; grantId?: string } | null> {
+): Promise<{ email: string; authMethod?: "oauth" | "api_key"; clientId?: string; grantId?: string } | null> {
   const token = getJWTFromRequest(request);
   if (!token) return null;
+
+  // ── API Key path ─────────────────────────────────────────────────────────
+  if (isApiKeyToken(token) && storage) {
+    const tokenHash = await sha256Hex(token);
+    const apiKey = await getApiKeyByHash(storage, tokenHash);
+    if (!apiKey || apiKey.revokedAt) return null;
+    const update = touchApiKeyLastUsed(storage, tokenHash);
+    if (ctx) ctx.waitUntil(update);
+    return {
+      email: apiKey.email,
+      authMethod: "api_key",
+    };
+  }
+
+  // ── JWT path ─────────────────────────────────────────────────────────────
   const payload = await verifyJWT(token, jwtSecret);
   if (!payload) return null;
   if (payload.grantId && storage) {

@@ -17,8 +17,19 @@ import {
 } from "./storage.js";
 import { signJWT, makeSessionCookie } from "./auth.js";
 import { isAllowedEmail } from "./access-policy.js";
+
 import type { OAuthTokenResponse } from "./storage.js";
 import type { GoogleTokens, GoogleUserInfo, OAuthClientGrant, RegisteredClient } from "./types.js";
+
+
+/** Count entries in ALLOWED_EMAILS for logging (no secret spill). */
+function parseAllowedListLen(csv: string): number {
+  if (!csv) return 0;
+  return csv
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean).length;
+}
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -713,19 +724,25 @@ export function registerOAuthRoutes(
       `Google OAuth callback flow=${oauthState.type} email=${user.email} refresh_token=${rawTokens.refresh_token ? "present" : "missing"} expires_in=${rawTokens.expires_in}`,
     );
 
-    // Email whitelist check
+    // Email whitelist check (exact match against ALLOWED_EMAILS CSV).
     if (!isAllowedEmail(user.email, c.env.ALLOWED_EMAILS)) {
+      console.warn(
+        `OAuth denied: email=${user.email} not in ALLOWED_EMAILS (count=${parseAllowedListLen(c.env.ALLOWED_EMAILS)})`,
+      );
+      const description = `Your account (${user.email}) is not authorized. Sign in with a family email listed in ALLOWED_EMAILS.`;
       if (oauthState.type === "mcp") {
         const errUrl = new URL(oauthState.redirectUri);
         errUrl.searchParams.set("error", "access_denied");
-        errUrl.searchParams.set("error_description", "Your account is not authorized.");
+        // Include the Google email so clients/users can see *which* identity was denied.
+        errUrl.searchParams.set("error_description", description);
         if (oauthState.clientState) errUrl.searchParams.set("state", oauthState.clientState);
         return c.redirect(errUrl.toString(), 302);
       }
       return c.html(
         htmlPage(
           "Access Denied",
-          `<p>Your account (<strong>${escapeHtml(user.email)}</strong>) is not authorized to use this server.</p>`,
+          `<p>Your account (<strong>${escapeHtml(user.email)}</strong>) is not authorized to use this server.</p>
+           <p>Sign in with a family member email listed in <code>ALLOWED_EMAILS</code>, or update that Worker var in Cloudflare.</p>`,
         ),
         403,
       );
