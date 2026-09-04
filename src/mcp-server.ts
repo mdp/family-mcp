@@ -2,9 +2,8 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import type { Env } from "./env.js";
 import type { Storage } from "./storage.js";
-import { getTokens } from "./storage.js";
-import type { AuthExtra } from "./types.js";
 import { GoogleClient } from "./google-client.js";
+import type { GoogleTokens, AuthExtra } from "./types.js";
 import {
   resolveTargetAccount,
   assertRecipientsAllowed,
@@ -62,6 +61,25 @@ function successResult(data: unknown) {
 
 function authEmail(extra: { authInfo?: { extra?: unknown } }): string | undefined {
   return (extra.authInfo?.extra as AuthExtra | undefined)?.email;
+}
+
+// ─── GoogleClient cache (KV read reduction) ──────────────────────────────────
+// GoogleClient.fromStorage does a KV read per call. Clients are cached in
+// isolate memory for a short window; ensureValidToken() still re-checks expiry
+// against the cached copy and falls back to a KV read + refresh when stale, so
+// caching cannot serve an expired access token for longer than that window.
+const CLIENT_CACHE_TTL_MS = 5 * 60_000;
+const googleClientCache = new Map<string, { client: GoogleClient; at: number }>();
+
+function cachedClient(email: string): GoogleClient | undefined {
+  const key = email.toLowerCase();
+  const entry = googleClientCache.get(key);
+  if (!entry) return undefined;
+  if (Date.now() - entry.at > CLIENT_CACHE_TTL_MS) {
+    googleClientCache.delete(key);
+    return undefined;
+  }
+  return entry.client;
 }
 
 export interface GmailSearchAllAccountResult {
@@ -206,12 +224,16 @@ export function createMcpServer(storage: Storage, env: Env, callerEmail: string)
   });
 
   async function clientFor(email: string): Promise<GoogleClient | null> {
-    return GoogleClient.fromStorage(
+    const cached = cachedClient(email);
+    if (cached) return cached;
+    const client = await GoogleClient.fromStorage(
       storage,
       email,
       env.GOOGLE_CLIENT_ID,
       env.GOOGLE_CLIENT_SECRET,
     );
+    if (client) googleClientCache.set(email.toLowerCase(), { client, at: Date.now() });
+    return client;
   }
 
   // ── accounts_list ─────────────────────────────────────────────────────────
@@ -226,16 +248,19 @@ export function createMcpServer(storage: Storage, env: Env, callerEmail: string)
       const emails = parseAllowedList(env.ALLOWED_EMAILS);
       const results = await Promise.all(
         emails.map(async (e) => {
-          let tokens = await getTokens(storage, e);
           const client = await clientFor(e);
           const profile = listFamilyMembers(familyProfiles).find((member) => member.email.toLowerCase() === e);
           let authorized = client !== null;
           let auth_error: string | null = null;
 
+          // ensureValidToken may refresh in the background (one KV write per
+          // interval per account); the snapshot reflects pre- or post-refresh
+          // state without extra KV reads.
+          let tokens: GoogleTokens | null = client ? client.tokenSnapshot : null;
           if (client) {
             try {
               await client.ensureValidToken();
-              tokens = await getTokens(storage, e);
+              tokens = client.tokenSnapshot;
             } catch (error) {
               authorized = false;
               auth_error = String(error);

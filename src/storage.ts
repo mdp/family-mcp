@@ -361,11 +361,26 @@ export async function revokeApiKey(storage: Storage, tokenHash: string, email: s
   return true;
 }
 
-export async function touchApiKeyLastUsed(storage: Storage, tokenHash: string): Promise<void> {
-  const existing = await getApiKeyByHash(storage, tokenHash);
-  if (!existing || existing.revokedAt) return;
-  existing.lastUsedAt = Date.now();
-  await storage.put(`${API_KEY_PREFIX}${tokenHash}`, JSON.stringify(existing));
+// ─── Last-used bookkeeping ────────────────────────────────────────────────────
+// KV writes are the scarce resource (1k/day on the free tier), so last-used
+// timestamps are persisted at most once per interval instead of per request.
+export const LAST_USED_WRITE_INTERVAL_MS = 60 * 60 * 1000;
+
+export function shouldPersistLastUsed(lastUsedAt: number | undefined | null): boolean {
+  return !lastUsedAt || Date.now() - lastUsedAt > LAST_USED_WRITE_INTERVAL_MS;
+}
+
+export async function touchApiKeyLastUsed(storage: Storage, apiKey: ApiKey): Promise<void> {
+  if (apiKey.revokedAt) return;
+  if (!shouldPersistLastUsed(apiKey.lastUsedAt)) return;
+  apiKey.lastUsedAt = Date.now();
+  await storage.put(`${API_KEY_PREFIX}${apiKey.tokenHash}`, JSON.stringify(apiKey));
+}
+
+export async function touchOAuthGrantLastUsed(storage: Storage, grant: OAuthClientGrant): Promise<void> {
+  if (!shouldPersistLastUsed(grant.lastUsedAt)) return;
+  grant.lastUsedAt = Date.now();
+  await storage.put(`${OAUTH_GRANT_PREFIX}${grant.grantId}`, JSON.stringify(grant));
 }
 
 // ─── OAuth Grant listing ─────────────────────────────────────────────────────

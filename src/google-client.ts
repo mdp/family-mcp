@@ -36,6 +36,11 @@ function googleTokenErrorMessage(status: number, body: string): string {
 export class GoogleClient {
   private tokens: GoogleTokens;
 
+  /** Point-in-time copy of the in-memory tokens (no KV read). */
+  get tokenSnapshot(): GoogleTokens {
+    return { ...this.tokens };
+  }
+
   constructor(
     tokens: GoogleTokens,
     private clientId: string,

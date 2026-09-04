@@ -1,7 +1,8 @@
 import { SignJWT, jwtVerify } from "jose";
 import type { JWTPayload } from "./types.js";
 import type { Storage } from "./storage.js";
-import { getOAuthGrant, getApiKeyByHash, touchApiKeyLastUsed } from "./storage.js";
+import { getOAuthGrant, getApiKeyByHash, touchApiKeyLastUsed, touchOAuthGrantLastUsed } from "./storage.js";
+import type { ApiKey, OAuthClientGrant } from "./types.js";
 
 // ─── JWT ──────────────────────────────────────────────────────────────────────
 
@@ -98,6 +99,26 @@ async function sha256Hex(value: string): Promise<string> {
 
 // ─── Auth resolution ──────────────────────────────────────────────────────────
 
+// ── KV usage throttling ──────────────────────────────────────────────────────
+// Auth resolution runs on every request. To keep KV operations (especially
+// writes) to a minimum, repeated lookups are served from isolate memory and
+// last-used timestamps are persisted at most once per interval (see
+// storage.ts). Revocations therefore take up to LOOKUP_CACHE_TTL_MS to be
+// observed within a warm isolate, which is acceptable here.
+const LOOKUP_CACHE_TTL_MS = 60_000;
+const apiKeyCache = new Map<string, { value: ApiKey | null; at: number }>();
+const grantCache = new Map<string, { value: OAuthClientGrant | null; at: number }>();
+
+function cachedLookup<T>(map: Map<string, { value: T; at: number }>, key: string): T | undefined {
+  const entry = map.get(key);
+  if (!entry) return undefined;
+  if (Date.now() - entry.at > LOOKUP_CACHE_TTL_MS) {
+    map.delete(key);
+    return undefined;
+  }
+  return entry.value;
+}
+
 export async function resolveAuth(
   request: Request,
   jwtSecret: string,
@@ -110,9 +131,13 @@ export async function resolveAuth(
   // ── API Key path ─────────────────────────────────────────────────────────
   if (isApiKeyToken(token) && storage) {
     const tokenHash = await sha256Hex(token);
-    const apiKey = await getApiKeyByHash(storage, tokenHash);
+    let apiKey = cachedLookup(apiKeyCache, tokenHash);
+    if (apiKey === undefined) {
+      apiKey = await getApiKeyByHash(storage, tokenHash);
+      apiKeyCache.set(tokenHash, { value: apiKey, at: Date.now() });
+    }
     if (!apiKey || apiKey.revokedAt) return null;
-    const update = touchApiKeyLastUsed(storage, tokenHash);
+    const update = touchApiKeyLastUsed(storage, apiKey);
     if (ctx) ctx.waitUntil(update);
     return {
       email: apiKey.email,
@@ -124,9 +149,13 @@ export async function resolveAuth(
   const payload = await verifyJWT(token, jwtSecret);
   if (!payload) return null;
   if (payload.grantId && storage) {
-    const grant = await getOAuthGrant(storage, payload.grantId);
+    let grant = cachedLookup(grantCache, payload.grantId);
+    if (grant === undefined) {
+      grant = await getOAuthGrant(storage, payload.grantId);
+      grantCache.set(payload.grantId, { value: grant, at: Date.now() });
+    }
     if (!grant || grant.email !== payload.email || grant.clientId !== payload.clientId) return null;
-    const update = storage.put(`mcp:grant:${grant.grantId}`, JSON.stringify({ ...grant, lastUsedAt: Date.now() }));
+    const update = touchOAuthGrantLastUsed(storage, grant);
     if (ctx) ctx.waitUntil(update);
   }
   return {
