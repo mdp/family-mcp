@@ -21,6 +21,9 @@ const config = {
   main: "src/index.ts",
   compatibility_date: "2025-01-13",
   compatibility_flags: ["nodejs_compat"],
+  // Runtime vars are managed on Cloudflare, not in this generated config.
+  // Without this, deploying deletes dashboard-managed vars such as ALLOWED_EMAILS.
+  keep_vars: true,
   kv_namespaces: [
     {
       binding: "STATE_KV",
