@@ -12,17 +12,18 @@
     "test": "vitest run"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "1.29.0",
-    "hono": "^4.12.27",
-    "jose": "^5.9.6",
-    "marked": "^17.0.5",
-    "zod": "^3.24.4"
+    "@modelcontextprotocol/sdk": "1.32.1",
+    "hono": "^4.13.13",
+    "jose": "^5.10.0",
+    "marked": "^17.0.6",
+    "zod": "^3.25.76"
   },
   "devDependencies": {
-    "@cloudflare/workers-types": "^4.20260625.1",
-    "@types/node": "^26.0.1",
-    "typescript": "^5.8.3",
-    "vitest": "^4.1.9",
-    "wrangler": "^4.105.0"
+    "@cloudflare/workers-types": "^5.20261021.1",
+    "@types/node": "^26.6.5",
+    "typescript": "^5.9.3",
+    "vite": "^8.1.6",
+    "vitest": "^4.1.12",
+    "wrangler": "^4.151.3"
   }
 }
